@@ -34,7 +34,7 @@ INDEX_COL = "__index__"
 ALL_COLUMNS_DUPLICATES = "__all_columns__"
 DEMO_SOURCE_CHOICE = "__demo_data__"
 DEMO_DATA_FILE = Path(__file__).with_name("df_monthly.csv")
-PLOTLY_FIG_HEIGHT = 700
+PLOTLY_FIG_HEIGHT = 600
 UPLOAD_CACHE_DIR = Path("/private/tmp") / "csv_dashboard_uploads"
 UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -77,7 +77,15 @@ def matplotlib_to_html(fig: plt.Figure) -> ui.Tag:
 
 def plotly_to_html(fig) -> ui.Tag:
     """Convert a Plotly figure into embeddable HTML."""
-    return ui.HTML(fig.to_html(full_html=False, include_plotlyjs="cdn"))
+    return ui.HTML(
+        fig.to_html(
+            full_html=False,
+            include_plotlyjs="cdn",
+            default_width="100%",
+            default_height=f"{PLOTLY_FIG_HEIGHT}px",
+            config={"responsive": True},
+        )
+    )
 
 
 def make_demo_data(n: int = 400) -> pd.DataFrame:
@@ -243,6 +251,313 @@ def stat_numeric_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(frame)
 
 
+def stat_logistic_predictor_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Build a complete-case design matrix for logistic regression predictors."""
+    if not columns:
+        return pd.DataFrame(index=df.index)
+
+    raw = pd.DataFrame(index=df.index)
+    categorical_cols: list[str] = []
+
+    for col in columns:
+        series = stat_selected_series(df, col)
+        if pd.api.types.is_datetime64_any_dtype(series):
+            raw[col] = series_to_stat_numeric(series)
+        elif pd.api.types.is_numeric_dtype(series):
+            raw[col] = pd.to_numeric(series, errors="coerce")
+        else:
+            raw[col] = series.astype("string")
+            categorical_cols.append(col)
+
+    raw = raw.dropna()
+    if raw.empty:
+        return pd.DataFrame(index=raw.index)
+
+    parts: list[pd.DataFrame] = []
+    numeric_cols = [col for col in columns if col not in categorical_cols]
+    if numeric_cols:
+        parts.append(raw[numeric_cols].astype(float))
+    if categorical_cols:
+        encoded = pd.get_dummies(
+            raw[categorical_cols].astype("string"),
+            prefix=categorical_cols,
+            prefix_sep="=",
+            drop_first=True,
+            dummy_na=False,
+        )
+        if not encoded.empty:
+            parts.append(encoded.astype(float))
+
+    if not parts:
+        return pd.DataFrame(index=raw.index)
+    return pd.concat(parts, axis=1)
+
+
+def exact_find_replace(series: pd.Series, find_text: str, replace_text: str) -> pd.Series:
+    """Replace exact matches in a series while respecting numeric columns."""
+    numeric_series = pd.to_numeric(series, errors="coerce")
+    numeric_like = pd.api.types.is_numeric_dtype(series) or (
+        series.notna().any() and numeric_series.notna().sum() == series.notna().sum()
+    )
+    if numeric_like:
+        find_value = pd.to_numeric(pd.Series([find_text]), errors="coerce").iloc[0]
+        if pd.isna(find_value):
+            return series.astype("string").where(series.astype("string") != str(find_text), replace_text)
+
+        replacement_value = pd.to_numeric(pd.Series([replace_text]), errors="coerce").iloc[0]
+        if pd.isna(replacement_value):
+            return series.astype("string").where(numeric_series != find_value, replace_text)
+        return numeric_series.where(numeric_series != find_value, replacement_value)
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        find_value = pd.to_datetime(pd.Series([find_text]), errors="coerce", format="mixed").iloc[0]
+        if pd.isna(find_value):
+            return series.astype("string").where(series.astype("string") != str(find_text), replace_text)
+
+        replacement_value = pd.to_datetime(pd.Series([replace_text]), errors="coerce", format="mixed").iloc[0]
+        if pd.isna(replacement_value):
+            return series.astype("string").where(series != find_value, replace_text)
+        return series.where(series != find_value, replacement_value)
+
+    return series.astype("string").where(series.astype("string") != str(find_text), replace_text)
+
+
+def _binary_auc(x: pd.Series, y: pd.Series) -> float:
+    """Compute a rank-based AUC for a binary target."""
+    x = pd.Series(x)
+    y = pd.Series(y)
+    valid = x.notna() & y.notna()
+    if int(valid.sum()) < 2:
+        return float("nan")
+
+    x_valid = x.loc[valid]
+    y_valid = y.loc[valid].astype(float)
+    if x_valid.nunique(dropna=True) < 2 or y_valid.nunique(dropna=True) < 2:
+        return float("nan")
+
+    n_pos = float(y_valid.sum())
+    n_neg = float(len(y_valid) - n_pos)
+    if n_pos <= 0 or n_neg <= 0:
+        return float("nan")
+
+    ranks = x_valid.rank(method="average")
+    u_stat = float(ranks[y_valid >= 0.5].sum() - n_pos * (n_pos + 1.0) / 2.0)
+    return u_stat / (n_pos * n_neg)
+
+
+def logistic_separation_diagnostics(
+    predictors: pd.DataFrame,
+    y: pd.Series,
+    *,
+    fit: Optional[dict[str, object]] = None,
+    max_signal_rows: int = 6,
+) -> tuple[pd.DataFrame, str]:
+    """Build a diagnostic report for separation and leakage signals."""
+    y = pd.Series(y).astype(float).reset_index(drop=True)
+    predictors = predictors.reset_index(drop=True)
+    if predictors.empty or y.empty:
+        return pd.DataFrame(columns=["Metric", "Value", "Details"]), ""
+
+    diagnostics: list[dict[str, object]] = []
+    signal_rows: list[dict[str, object]] = []
+    complete_hits: list[str] = []
+    quasi_hits: list[str] = []
+
+    for col in predictors.columns:
+        series = predictors[col]
+        series_str = series.astype("string")
+        numeric_candidate = pd.to_numeric(series, errors="coerce")
+        numeric_like = pd.api.types.is_numeric_dtype(series) or (
+            series.notna().sum() > 0 and numeric_candidate.notna().sum() == series.notna().sum()
+        )
+
+        if numeric_like:
+            numeric_series = numeric_candidate
+            valid = numeric_series.notna() & y.notna()
+            if int(valid.sum()) < 2:
+                continue
+            x = numeric_series.loc[valid].astype(float)
+            yy = y.loc[valid].astype(float)
+            if x.nunique(dropna=True) < 2 or yy.nunique(dropna=True) < 2:
+                continue
+
+            auc = _binary_auc(x, yy)
+            if np.isnan(auc):
+                continue
+            strength = max(auc, 1.0 - auc)
+            direction = "positive" if auc >= 0.5 else "inverse"
+            class0 = x.loc[yy < 0.5]
+            class1 = x.loc[yy >= 0.5]
+            range_separated = bool(
+                len(class0) > 0
+                and len(class1) > 0
+                and (
+                    float(np.nanmax(class0)) < float(np.nanmin(class1))
+                    or float(np.nanmax(class1)) < float(np.nanmin(class0))
+                )
+            )
+
+            if range_separated:
+                complete_hits.append(col)
+                signal_rows.append(
+                    {
+                        "Metric": "Complete separation signal",
+                        "Value": col,
+                        "Details": f"numeric/datetime range does not overlap; AUC={auc:.4f}",
+                    }
+                )
+            elif strength >= 0.95:
+                if strength >= 0.995:
+                    quasi_hits.append(col)
+                signal_rows.append(
+                    {
+                        "Metric": "Near-separation signal",
+                        "Value": col,
+                        "Details": f"AUC={auc:.4f} ({direction})",
+                    }
+                )
+            continue
+
+        ctab = pd.crosstab(series_str, y, dropna=False)
+        if ctab.empty or ctab.shape[1] < 2:
+            continue
+
+        counts = ctab.to_numpy(dtype=float)
+        row_totals = counts.sum(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            row_purity = np.nanmax(counts / row_totals[:, None], axis=1)
+        best_idx = int(np.nanargmax(row_purity)) if np.isfinite(row_purity).any() else -1
+        best_level = str(ctab.index[best_idx]) if best_idx >= 0 else str(col)
+        best_purity = float(row_purity[best_idx]) if best_idx >= 0 else float("nan")
+
+        pure_levels: list[str] = []
+        for level, row in ctab.iterrows():
+            row_values = row.to_numpy(dtype=float)
+            if float(row_values.sum()) <= 0:
+                continue
+            if np.any(row_values == 0.0):
+                pure_levels.append(f"{level} ({', '.join(f'{int(v)}' for v in row_values)})")
+
+        if pure_levels:
+            complete_hits.append(col)
+            signal_rows.append(
+                {
+                    "Metric": "Complete separation signal",
+                    "Value": col,
+                    "Details": f"pure level(s): {', '.join(pure_levels[:2])}",
+                }
+            )
+        elif best_purity >= 0.95:
+            quasi_hits.append(col)
+            signal_rows.append(
+                {
+                    "Metric": "Near-separation signal",
+                    "Value": col,
+                    "Details": f"best level {best_level} purity={best_purity:.4f}",
+                }
+            )
+
+    complete = bool(complete_hits)
+    quasi = bool(quasi_hits)
+
+    diagnostics.append(
+        {
+            "Metric": "Complete separation",
+            "Value": "Yes" if complete else "No",
+            "Details": ", ".join(dict.fromkeys(complete_hits)) if complete_hits else "No single predictor is perfectly pure.",
+        }
+    )
+    diagnostics.append(
+        {
+            "Metric": "Quasi-separation",
+            "Value": "Yes" if quasi else "No",
+            "Details": ", ".join(dict.fromkeys(quasi_hits)) if quasi_hits else "No strong single-predictor signal detected.",
+        }
+    )
+
+    if fit is not None:
+        probs = np.asarray(fit.get("probabilities", []), dtype=float)
+        beta = np.asarray(fit.get("fitted", []), dtype=float)
+        extreme_rate = float(np.mean((probs < 0.01) | (probs > 0.99))) if probs.size else float("nan")
+        max_abs_coef = float(np.nanmax(np.abs(beta))) if beta.size else float("nan")
+        diagnostics.append(
+            {
+                "Metric": "Model stability",
+                "Value": "watch" if (np.isfinite(extreme_rate) and extreme_rate >= 0.95) else "ok",
+                "Details": (
+                    f"extreme probability rate={extreme_rate:.3f}, max |coef|={max_abs_coef:.3f}"
+                    if np.isfinite(extreme_rate)
+                    else "No fitted probabilities available."
+                ),
+            }
+        )
+        if np.isfinite(extreme_rate) and extreme_rate >= 0.95 and not complete and not quasi:
+            diagnostics.append(
+                {
+                    "Metric": "Combination / leakage signal",
+                    "Value": "Suspected",
+                    "Details": "Model probabilities are extremely concentrated even though no single predictor is close to pure.",
+                }
+            )
+
+    diagnostics.extend(signal_rows[:max_signal_rows])
+    report = pd.DataFrame(diagnostics, columns=["Metric", "Value", "Details"])
+    warning_parts = []
+    if complete:
+        warning_parts.append(f"complete separation: {', '.join(dict.fromkeys(complete_hits))}")
+    if quasi:
+        warning_parts.append(f"quasi-separation: {', '.join(dict.fromkeys(quasi_hits))}")
+    warning = "; ".join(warning_parts)
+    return report, warning
+
+
+def prepare_logistic_analysis(
+    df: pd.DataFrame,
+    target_col: str,
+    predictor_cols: list[str],
+    positive_class: str,
+    *,
+    l2_penalty: float = 1.0,
+) -> dict[str, object]:
+    """Prepare the encoded design matrix, fit, and diagnostics for logistic regression."""
+    predictors = stat_logistic_predictor_frame(df, predictor_cols)
+    target_raw = stat_selected_series(df, target_col).astype("string")
+    logit_df = predictors.copy()
+    logit_df["_target_raw"] = target_raw
+    logit_df = logit_df.dropna()
+    if logit_df.empty:
+        return {"predictors": pd.DataFrame(), "logit_df": pd.DataFrame(), "fit": None, "diagnostics": pd.DataFrame(), "warning": "", "positive_class": positive_class}
+
+    label_order = list(dict.fromkeys(logit_df["_target_raw"].astype(str).tolist()))
+    if positive_class not in label_order and label_order:
+        positive_class = label_order[1] if len(label_order) > 1 else label_order[0]
+
+    logit_df["_y"] = (logit_df["_target_raw"].astype(str) == positive_class).astype(float)
+    if logit_df["_y"].nunique(dropna=True) < 2:
+        return {"predictors": predictors, "logit_df": logit_df, "fit": None, "diagnostics": pd.DataFrame(), "warning": "", "positive_class": positive_class}
+
+    fit = fit_logistic_regression(
+        logit_df[predictors.columns].to_numpy(dtype=float),
+        logit_df["_y"].to_numpy(dtype=float),
+        list(predictors.columns),
+        l2_penalty=l2_penalty,
+    )
+    raw_predictors = df.loc[logit_df.index, predictor_cols].copy()
+    diagnostics, warning = logistic_separation_diagnostics(
+        raw_predictors,
+        logit_df["_y"],
+        fit=fit,
+    )
+    return {
+        "predictors": predictors,
+        "logit_df": logit_df,
+        "fit": fit,
+        "diagnostics": diagnostics,
+        "warning": warning,
+        "positive_class": positive_class,
+    }
+
+
 def fit_multiple_linear_regression(X: np.ndarray, y: np.ndarray, predictor_names: list[str]) -> dict[str, object]:
     """Ordinary least squares multiple regression with summary stats."""
     X = np.asarray(X, dtype=float)
@@ -289,8 +604,15 @@ def fit_multiple_linear_regression(X: np.ndarray, y: np.ndarray, predictor_names
     }
 
 
-def fit_logistic_regression(X: np.ndarray, y: np.ndarray, predictor_names: list[str], max_iter: int = 100, tol: float = 1e-6) -> dict[str, object]:
-    """Binary logistic regression via iteratively reweighted least squares."""
+def fit_logistic_regression(
+    X: np.ndarray,
+    y: np.ndarray,
+    predictor_names: list[str],
+    l2_penalty: float = 1.0,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> dict[str, object]:
+    """Binary logistic regression via L2-regularized iteratively reweighted least squares."""
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float).reshape(-1)
     if X.ndim == 1:
@@ -298,13 +620,16 @@ def fit_logistic_regression(X: np.ndarray, y: np.ndarray, predictor_names: list[
     n, p = X.shape
     X1 = np.column_stack([np.ones(n), X])
     beta = np.zeros(p + 1, dtype=float)
+    penalty = max(float(l2_penalty), 0.0)
+    penalty_vec = np.concatenate([[0.0], np.full(p, penalty, dtype=float)])
+    hess = np.eye(p + 1, dtype=float)
 
     for iteration in range(1, max_iter + 1):
         eta = np.clip(X1 @ beta, -500, 500)
         prob = 1.0 / (1.0 + np.exp(-eta))
         w = prob * (1.0 - prob)
-        grad = X1.T @ (y - prob)
-        hess = X1.T @ (X1 * w[:, None]) + np.eye(p + 1) * 1e-8
+        grad = X1.T @ (y - prob) - penalty_vec * beta
+        hess = X1.T @ (X1 * w[:, None]) + np.diag(penalty_vec + 1e-8)
         step = np.linalg.pinv(hess) @ grad
         beta_new = beta + step
         if np.max(np.abs(step)) < tol:
@@ -324,7 +649,7 @@ def fit_logistic_regression(X: np.ndarray, y: np.ndarray, predictor_names: list[
     null_loglik = float(np.sum(y * np.log(null_prob + eps) + (1.0 - y) * np.log(1.0 - null_prob + eps)))
     mcfadden_r2 = 1.0 - loglik / null_loglik if null_loglik < 0 else float("nan")
     accuracy = float(np.mean(pred == y))
-    cov = np.linalg.pinv(X1.T @ (X1 * (prob * (1.0 - prob))[:, None]) + np.eye(p + 1) * 1e-8)
+    cov = np.linalg.pinv(hess)
     se = np.sqrt(np.clip(np.diag(cov), 0, np.inf))
     z_stats = beta / se
     coef_table = pd.DataFrame(
@@ -356,6 +681,8 @@ def fit_logistic_regression(X: np.ndarray, y: np.ndarray, predictor_names: list[
         "probabilities": prob,
         "predicted": pred,
         "fitted": beta,
+        "penalty": penalty,
+        "condition_number": float(np.linalg.cond(hess)),
     }
 
 
@@ -812,7 +1139,9 @@ app_ui = ui.page_fluid(
             flex-direction: column;
         }
         .plot-panel .card-body {
-            overflow: hidden;
+            overflow-x: hidden;
+            overflow-y: visible;
+            padding-bottom: 0.75rem;
         }
         .plot-stage {
             flex: 1 1 auto;
@@ -820,10 +1149,16 @@ app_ui = ui.page_fluid(
             display: flex;
             align-items: center;
             justify-content: center;
+            overflow: hidden;
         }
         .plot-stage .html-fill-container,
         .plot-stage .html-fill-item {
             width: 100%;
+            overflow: hidden;
+        }
+        .plot-stage .plotly,
+        .plot-stage .plotly-graph-div {
+            overflow: hidden;
         }
         .stats-panel {
             min-height: 420px;
@@ -946,8 +1281,13 @@ app_ui = ui.page_fluid(
                 ui.input_select(
                     "plot_kind",
                     "Plot type",
-                    choices=["scatter", "line", "bar", "histogram", "pie", "box", "heatmap"],
+                    choices=["scatter", "line", "bar", "stacked crosstab", "histogram", "pie", "box", "heatmap"],
                     selected="scatter",
+                ),
+                ui.panel_conditional(
+                    "input.plot_kind == 'heatmap'",
+                    ui.input_switch("heatmap_show_values", "Show correlation values", value=False),
+                    ui.help_text("Displays the correlation coefficient inside each heatmap cell."),
                 ),
                 ui.layout_columns(
                     ui.input_select("x_col", "X axis", choices=[]),
@@ -1180,7 +1520,7 @@ app_ui = ui.page_fluid(
                 ui.panel_conditional(
                     "input.column_tool == 'find_replace'",
                     ui.input_select("find_replace_col", "Column", choices=[]),
-                    ui.input_text("find_text", "Find", placeholder="text to find"),
+                    ui.input_text("find_text", "Find exact value", placeholder="value to match exactly"),
                     ui.input_text("replace_text", "Replace with", placeholder="replacement text"),
                 ),
                 ui.panel_conditional(
@@ -1648,8 +1988,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             find_text = input.find_text()
             replace_text = input.replace_text()
             if find_replace_col in new_df.columns and find_text:
-                series = new_df[find_replace_col].astype("string")
-                new_df[find_replace_col] = series.str.replace(find_text, replace_text, regex=False)
+                new_df[find_replace_col] = exact_find_replace(new_df[find_replace_col], find_text, replace_text)
         elif tool == "drop_rows":
             drop_rows_col = input.drop_rows_col()
             drop_rows_mode = input.drop_rows_mode()
@@ -1989,6 +2328,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         cols = [col for col in dict.fromkeys(cols) if col]
         if not cols:
             return pd.DataFrame(index=df.index)
+        if mode == "logistic regression":
+            return stat_logistic_predictor_frame(df, cols).dropna()
         return stat_numeric_frame(df, cols).dropna()
 
     @reactive.effect
@@ -2118,7 +2459,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         y2_log_default = current_y2_log
         hue_choices = ["None", INDEX_COL] + categorical_cols
         hue_default = current_hue if current_hue in hue_choices else "None"
-        column_tool_default = current_column_tool if current_column_tool in {"rename", "convert_type", "find_replace", "drop_rows", "z_score", "format_numeric", "calculate_formula", "pivot_wide", "melt", "join_tables", "find_duplicates", "drop_duplicates"} else "rename"
+        column_tool_default = current_column_tool if current_column_tool in {"rename", "convert_type", "find_replace", "drop_rows", "z_score normalisation", "format_numeric", "calculate_formula", "pivot_wide", "melt", "join_tables", "find_duplicates", "drop_duplicates"} else "rename"
         pie_label_default = categorical_cols[0] if categorical_cols else (cols[0] if cols else INDEX_COL)
         pie_value_default = "Count" if "Count" in pie_value_choices else (numeric_cols[0] if numeric_cols else INDEX_COL)
         rename_from_default = pick_single(current_rename_from, cols[0] if cols else INDEX_COL)
@@ -2192,10 +2533,13 @@ def server(input: Inputs, output: Outputs, session: Session):
             if current_stat_logit_positive_class in stat_logit_positive_choices
             else (stat_logit_positive_choices[1] if len(stat_logit_positive_choices) > 1 else (stat_logit_positive_choices[0] if stat_logit_positive_choices else ""))
         )
-        stat_logit_predictor_choices = {k: v for k, v in analysis_choices.items() if k != stat_logit_target_default}
+        stat_logit_predictor_choices = {k: v for k, v in choices.items() if k != stat_logit_target_default}
         stat_logit_predictor_default = [value for value in current_stat_logit_predictor_cols if value in stat_logit_predictor_choices]
         if not stat_logit_predictor_default:
-            stat_logit_predictor_default = [value for value in analysis_cols if value != stat_logit_target_default][:2]
+            preferred_logit_cols = [value for value in analysis_cols if value != stat_logit_target_default]
+            if not preferred_logit_cols:
+                preferred_logit_cols = [value for value in cols if value != stat_logit_target_default]
+            stat_logit_predictor_default = preferred_logit_cols[:2]
         stat_pca_default = [value for value in current_stat_pca_cols if value in analysis_choice_keys]
         if not stat_pca_default:
             stat_pca_default = analysis_cols[:3]
@@ -2291,7 +2635,6 @@ def server(input: Inputs, output: Outputs, session: Session):
             choices=["rename",
                         "convert_type",
                         "format_numeric",
-
                         "find_replace",
                         "drop_rows",
                         "find_duplicates",
@@ -2852,9 +3195,11 @@ def server(input: Inputs, output: Outputs, session: Session):
                 template="plotly_white",
                 title=title,
                 height=480,
-                margin=dict(l=55, r=25, t=60, b=55),
+                margin=dict(l=55, r=25, t=70, b=90),
                 autosize=True,
             )
+            fig.update_xaxes(automargin=True)
+            fig.update_yaxes(automargin=True)
             return fig
 
         def maybe_apply_log_axes(
@@ -3091,36 +3436,23 @@ def server(input: Inputs, output: Outputs, session: Session):
             if not predictor_cols:
                 return ui.div(ui.p("Choose at least one predictor column different from the target column."))
 
-            predictors = stat_numeric_frame(df, predictor_cols)
-            target_raw = selected_series(target_col).astype("string")
-            logit_df = predictors.copy()
-            logit_df["_target_raw"] = target_raw
-            logit_df = logit_df.dropna()
-            if logit_df.empty:
-                return ui.div(ui.p("Choose a binary or one-vs-rest target with valid predictor rows."))
+            analysis = prepare_logistic_analysis(df, target_col, predictor_cols, positive_class)
+            predictors = analysis["predictors"]
+            logit_df = analysis["logit_df"]
+            fit = analysis["fit"]
+            diagnostics = analysis["diagnostics"]
+            warning = str(analysis["warning"] or "")
+            positive_class = str(analysis["positive_class"] or positive_class)
+            if fit is None or logit_df.empty or predictors.empty:
+                return ui.div(ui.p("Choose a binary target with valid predictor rows."))
 
-            label_order = list(dict.fromkeys(logit_df["_target_raw"].astype(str).tolist()))
-            if len(label_order) < 2:
-                return ui.div(ui.p("Logistic regression needs at least two target classes."))
-            if positive_class not in label_order:
-                positive_class = label_order[1] if len(label_order) > 1 else label_order[0]
-
-            logit_df["_y"] = (logit_df["_target_raw"].astype(str) == positive_class).astype(float)
-            if logit_df["_y"].nunique(dropna=True) < 2:
-                return ui.div(ui.p("The selected positive class does not create a binary outcome."))
-
-            fit = fit_logistic_regression(
-                logit_df[predictor_cols].to_numpy(dtype=float),
-                logit_df["_y"].to_numpy(dtype=float),
-                predictor_cols,
-            )
             plot_df = pd.DataFrame(
                 {
                     "actual": np.where(logit_df["_y"].to_numpy(dtype=float) >= 0.5, positive_class, f"not {positive_class}"),
                     "probability": fit["probabilities"],
                 }
             )
-            plot_df = attach_cluster_labels(plot_df, logit_df[predictor_cols])
+            plot_df = attach_cluster_labels(plot_df, logit_df[predictors.columns])
             box_kwargs = dict(
                 data_frame=plot_df,
                 x="actual",
@@ -3136,6 +3468,17 @@ def server(input: Inputs, output: Outputs, session: Session):
             fig.add_hline(y=0.5, line_dash="dash", line_color="black")
             fig.update_layout(template="plotly_white")
             fig.update_yaxes(range=[0, 1], title_text=f"Probability of {positive_class}")
+            if warning:
+                fig.add_annotation(
+                    text=warning,
+                    xref="paper",
+                    yref="paper",
+                    x=0.01,
+                    y=1.12,
+                    showarrow=False,
+                    align="left",
+                    font=dict(size=11, color="#6c757d"),
+                )
             format_stats_fig(fig, "Logistic regression preview")
             maybe_apply_log_axes(fig, y_values=plot_df["probability"], y_allowed=True)
             cache_plotly(stats_plot_cache, fig, "statistics_plot")
@@ -3460,34 +3803,20 @@ def server(input: Inputs, output: Outputs, session: Session):
                 return pd.DataFrame()
             if stat_logit_target_col in stat_logit_predictor_cols:
                 stat_logit_predictor_cols = [col for col in stat_logit_predictor_cols if col != stat_logit_target_col]
-            predictors = stat_numeric_frame(df, stat_logit_predictor_cols)
-            target_raw = selected_series(stat_logit_target_col).astype("string")
-            logit_df = predictors.copy()
-            logit_df["_target_raw"] = target_raw
-            logit_df = logit_df.dropna()
-            if logit_df.empty:
-                return pd.DataFrame()
-            label_order = list(dict.fromkeys(logit_df["_target_raw"].astype(str).tolist()))
-            if len(label_order) < 2:
-                return pd.DataFrame()
-            if str(stat_logit_positive_class) not in label_order:
-                stat_logit_positive_class = label_order[1] if len(label_order) > 1 else label_order[0]
-            logit_df["_y"] = (logit_df["_target_raw"].astype(str) == str(stat_logit_positive_class)).astype(float)
-            if logit_df["_y"].nunique(dropna=True) < 2:
-                return pd.DataFrame()
-            try:
-                fit = fit_logistic_regression(
-                    logit_df[stat_logit_predictor_cols].to_numpy(dtype=float),
-                    logit_df["_y"].to_numpy(dtype=float),
-                    stat_logit_predictor_cols,
-                )
-            except ValueError:
+            analysis = prepare_logistic_analysis(df, stat_logit_target_col, stat_logit_predictor_cols, str(stat_logit_positive_class))
+            predictors = analysis["predictors"]
+            logit_df = analysis["logit_df"]
+            fit = analysis["fit"]
+            diagnostics = analysis["diagnostics"]
+            if fit is None or predictors.empty or logit_df.empty:
                 return pd.DataFrame()
             coef_df = fit["coef_table"].copy()
+            diag_df = diagnostics.copy()
+            diag_df.insert(0, "Test", "Logistic regression")
             coef_df.insert(0, "Test", "Logistic regression")
             conf_df = fit["confusion"].copy()
             conf_df.insert(0, "Test", "Logistic regression")
-            return pd.concat([coef_df, conf_df], ignore_index=True, sort=False)
+            return pd.concat([diag_df, coef_df, conf_df], ignore_index=True, sort=False)
 
         if stat_mode == "PCA":
             if not stat_pca_cols:
@@ -3821,35 +4150,20 @@ def server(input: Inputs, output: Outputs, session: Session):
             if not predictor_cols:
                 return ui.div(ui.p("Choose at least one predictor column different from the target column."))
 
-            predictors = stat_numeric_frame(df, predictor_cols)
-            target_raw = selected_series(target_col).astype("string")
-            logit_df = predictors.copy()
-            logit_df["_target_raw"] = target_raw
-            logit_df = logit_df.dropna()
-            if logit_df.empty:
-                return ui.div(ui.p("Choose a target with valid predictor rows."))
-
-            label_order = list(dict.fromkeys(logit_df["_target_raw"].astype(str).tolist()))
-            if len(label_order) < 2:
-                return ui.div(ui.p("Logistic regression needs at least two target classes."))
-            if positive_class not in label_order:
-                positive_class = label_order[1] if len(label_order) > 1 else label_order[0]
-
-            logit_df["_y"] = (logit_df["_target_raw"].astype(str) == positive_class).astype(float)
-            if logit_df["_y"].nunique(dropna=True) < 2:
-                return ui.div(ui.p("The selected positive class does not create a binary outcome."))
-
-            try:
-                fit = fit_logistic_regression(
-                    logit_df[predictor_cols].to_numpy(dtype=float),
-                    logit_df["_y"].to_numpy(dtype=float),
-                    predictor_cols,
-                )
-            except ValueError as exc:
-                return ui.div(ui.p(str(exc)))
+            analysis = prepare_logistic_analysis(df, target_col, predictor_cols, positive_class)
+            predictors = analysis["predictors"]
+            logit_df = analysis["logit_df"]
+            fit = analysis["fit"]
+            diagnostics = analysis["diagnostics"]
+            warning = str(analysis["warning"] or "")
+            positive_class = str(analysis["positive_class"] or positive_class)
+            if fit is None or predictors.empty or logit_df.empty:
+                return ui.div(ui.p("Choose a binary target with valid predictor rows."))
 
             coef_df = fit["coef_table"].copy()
             conf_df = fit["confusion"].copy()
+            diag_df = diagnostics.copy()
+            diag_df.insert(0, "Test", "Logistic regression")
             return ui.div(
                 stat_row(
                     [
@@ -3877,6 +4191,10 @@ def server(input: Inputs, output: Outputs, session: Session):
                         ("Predicted positives", int(np.sum(fit["predicted"] >= 0.5))),
                     ]
                 ),
+                ui.br(),
+                ui.div(warning or "No strong separation signal detected.", class_="small-muted"),
+                ui.br(),
+                table_block("Logistic diagnostics", diag_df),
                 ui.br(),
                 table_block("Logistic coefficients", coef_df.round(6)),
                 ui.br(),
@@ -4057,6 +4375,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         df = data().copy()
         viz_engine = input.viz_engine()
         plot_kind = input.plot_kind()
+        heatmap_show_values = bool(input.heatmap_show_values())
         x_col = input.x_col()
         y_col = input.y_col()
         x_log = bool(input.x_log())
@@ -4167,6 +4486,9 @@ def server(input: Inputs, output: Outputs, session: Session):
             except Exception:
                 return default
 
+        def display_col(col: str) -> str:
+            return "Index" if col == INDEX_COL else str(col)
+
         plot_title_override = input.plot_title().strip()
         x_title_override = input.x_axis_title().strip()
         y_title_override = input.y_axis_title().strip()
@@ -4190,7 +4512,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                 title_text=resolve_text(plot_title_override, default_title),
                 title_font=dict(size=plot_title_font_size),
                 height=PLOTLY_FIG_HEIGHT,
-                margin=dict(l=55, r=25, t=60, b=55),
+                margin=dict(l=55, r=25, t=70, b=90),
                 autosize=True,
             )
             if x_title is not None:
@@ -4202,6 +4524,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                     gridcolor=f"rgba(15, 23, 42, {grid_alpha})",
                     zeroline=False,
                     title_font=dict(size=axis_title_font_size),
+                    automargin=True,
                 )
             if y_title is not None:
                 fig.update_yaxes(
@@ -4210,6 +4533,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                     gridcolor=f"rgba(15, 23, 42, {grid_alpha})",
                     zeroline=False,
                     title_font=dict(size=axis_title_font_size),
+                    automargin=True,
                 )
 
         def apply_mpl_formatting(ax, default_title: str, x_title: Optional[str] = None, y_title: Optional[str] = None, x_locator_series: Optional[pd.Series] = None) -> None:
@@ -4334,7 +4658,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                         title_font=dict(size=plot_title_font_size),
                         legend_title_text="",
                         height=PLOTLY_FIG_HEIGHT,
-                        margin=dict(l=55, r=25, t=60, b=55),
+                        margin=dict(l=55, r=25, t=70, b=90),
                         autosize=True,
                     )
                     fig.update_xaxes(
@@ -4344,6 +4668,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                         showgrid=grid_enabled("x"),
                         gridcolor=f"rgba(15, 23, 42, {grid_alpha})",
                         zeroline=False,
+                        automargin=True,
                     )
                     fig.update_yaxes(
                         title_text=resolve_text(y_title_override, y_axis_label),
@@ -4486,7 +4811,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                         title_font=dict(size=plot_title_font_size),
                         legend_title_text="",
                         height=PLOTLY_FIG_HEIGHT,
-                        margin=dict(l=55, r=25, t=60, b=55),
+                        margin=dict(l=55, r=25, t=70, b=90),
                         autosize=True,
                     )
                     fig.update_xaxes(
@@ -4496,6 +4821,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                         showgrid=grid_enabled("x"),
                         gridcolor=f"rgba(15, 23, 42, {grid_alpha})",
                         zeroline=False,
+                        automargin=True,
                     )
                     fig.update_yaxes(
                         title_text=resolve_text(y_title_override, y_axis_label),
@@ -4715,6 +5041,62 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.set_ylabel(axis_title(y_plot_col if y_col else "Count", bar_y_mode))
             apply_mpl_axis_scale(ax, bar_x_mode, bar_y_mode)
             apply_mpl_formatting(ax, "Bar plot", axis_title(x_col, bar_x_mode), axis_title(y_plot_col if y_col else "Count", bar_y_mode), agg["_plot_x"])
+            fig.tight_layout()
+            cache_matplotlib(main_plot_cache, fig, "current_plot")
+            return matplotlib_to_html(fig)
+        elif plot_kind == "stacked crosstab":
+            if not hue_col:
+                return mpl_message("Choose a Group / color column for the stacked crosstab plot.")
+            crosstab_df = plot_df[[x_col, hue_col]].dropna()
+            if crosstab_df.empty:
+                return mpl_message("No data available for the selected x and group columns.")
+
+            crosstab = pd.crosstab(crosstab_df[x_col].astype(str), crosstab_df[hue_col].astype(str))
+            if crosstab.empty:
+                return mpl_message("No cross-tabulated counts available for the selected columns.")
+
+            if viz_engine == "plotly":
+                fig = go.Figure()
+                group_totals = crosstab.sum(axis=1).reindex(crosstab.index).to_numpy(dtype=float)
+                x_labels = crosstab.index.astype(str).tolist()
+                for level in crosstab.columns:
+                    counts = crosstab[level].to_numpy(dtype=float)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        share = np.where(group_totals > 0, counts / group_totals, np.nan)
+                    fig.add_trace(
+                        go.Bar(
+                            name=str(level),
+                            x=x_labels,
+                            y=counts,
+                            customdata=np.column_stack([group_totals, share]),
+                            hovertemplate=(
+                                f"{display_col(x_col)}=%{{x}}<br>"
+                                f"{display_col(hue_col)}=%{{fullData.name}}<br>"
+                                "Count=%{y}<br>"
+                                f"Total in {display_col(x_col)}=%{{customdata[0]:.0f}}<br>"
+                                "Share of total=%{customdata[1]:.1%}<extra></extra>"
+                            ),
+                        )
+                    )
+                fig.update_layout(
+                    barmode="stack",
+                    template="plotly_white",
+                    legend_title_text=display_col(hue_col),
+                )
+                fig.update_xaxes(title_text=display_col(x_col))
+                fig.update_yaxes(title_text="Count")
+                apply_plotly_formatting(fig, "Stacked crosstab count plot", display_col(x_col), "Count")
+                cache_plotly(main_plot_cache, fig, "current_plot")
+                return plotly_to_html(fig)
+
+            fig, ax = plt.subplots(figsize=(10, 5), dpi=160)
+            crosstab.plot(kind="bar", stacked=True, ax=ax, colormap="tab20")
+            ax.set_title("Stacked crosstab count plot")
+            ax.set_xlabel(display_col(x_col))
+            ax.set_ylabel("Count")
+            ax.legend(title=display_col(hue_col), bbox_to_anchor=(1.02, 1), loc="upper left")
+            ax.tick_params(axis="x", rotation=45)
+            apply_mpl_formatting(ax, "Stacked crosstab count plot", display_col(x_col), "Count", None)
             fig.tight_layout()
             cache_matplotlib(main_plot_cache, fig, "current_plot")
             return matplotlib_to_html(fig)
@@ -4969,13 +5351,34 @@ def server(input: Inputs, output: Outputs, session: Session):
 
             corr = numeric_df.corr(numeric_only=True)
             if viz_engine == "plotly":
-                fig = px.imshow(corr, color_continuous_scale="Viridis", aspect="auto", title="Correlation heatmap")
+                fig = px.imshow(
+                    corr,
+                    color_continuous_scale="Viridis",
+                    aspect="auto",
+                    title="Correlation heatmap",
+                )
                 apply_plotly_formatting(fig, "Correlation heatmap", "Variable", "Variable")
+                if heatmap_show_values:
+                    value_threshold = float((np.nanmin(corr.to_numpy()) + np.nanmax(corr.to_numpy())) / 2.0)
+                    for row_idx, row_label in enumerate(corr.index):
+                        for col_idx, col_label in enumerate(corr.columns):
+                            value = float(corr.iat[row_idx, col_idx])
+                            fig.add_annotation(
+                                x=col_label,
+                                y=row_label,
+                                text=f"{value:.2f}",
+                                showarrow=False,
+                                font=dict(color="white" if value < value_threshold else "black", size=12),
+                            )
                 cache_plotly(main_plot_cache, fig, "current_plot")
                 return plotly_to_html(fig)
             if viz_engine == "seaborn":
                 fig, ax = plt.subplots(figsize=(10, 5), dpi=160)
-                sns.heatmap(corr, cmap="viridis", ax=ax)
+                heatmap = sns.heatmap(corr, cmap="viridis", ax=ax, annot=heatmap_show_values, fmt=".2f")
+                if heatmap_show_values:
+                    flat_values = corr.to_numpy().ravel()
+                    for text, value in zip(ax.texts, flat_values):
+                        text.set_color("white" if heatmap.collections[0].norm(value) > 0.5 else "black")
                 ax.set_title("Correlation heatmap")
                 apply_mpl_formatting(ax, "Correlation heatmap", "Variable", "Variable")
                 fig.tight_layout()
@@ -4987,6 +5390,19 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.set_xticklabels(corr.columns, rotation=45, ha="right")
             ax.set_yticks(range(len(corr.index)))
             ax.set_yticklabels(corr.index)
+            if heatmap_show_values:
+                for i in range(corr.shape[0]):
+                    for j in range(corr.shape[1]):
+                        value = float(corr.iat[i, j])
+                        ax.text(
+                            j,
+                            i,
+                            f"{value:.2f}",
+                            ha="center",
+                            va="center",
+                            color="white" if im.norm(value) > 0.5 else "black",
+                            fontsize=8,
+                        )
             fig.colorbar(im, ax=ax)
             ax.set_title("Correlation heatmap")
             apply_mpl_formatting(ax, "Correlation heatmap", "Variable", "Variable")
