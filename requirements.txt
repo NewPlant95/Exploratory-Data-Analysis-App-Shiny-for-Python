@@ -1,0 +1,7 @@
+shiny
+numpy
+pandas
+matplotlib
+seaborn
+plotly
+kaleido
