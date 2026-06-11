@@ -1,0 +1,153 @@
+The Statistics panel in this app has several modes. They all use the currently active dataset, but each mode asks a different question and uses different selectors.
+
+Important workflow note:
+The app does not refit statistics continuously as you change the selectors. It stores the current settings when you click Run statistics, and the text output and preview plot use that saved configuration until you run the test again.
+
+Descriptive statistics
+This mode summarizes one selected column.
+
+Selector:
+- Column: choose the numeric or datetime column you want to inspect.
+
+What it does:
+- Computes summary values such as count, missing values, mean, median, standard deviation, min, quartiles, max, variance, skew, and kurtosis.
+- Shows a preview plot of the selected column’s distribution.
+
+Correlation
+This mode measures how strongly two variables move together.
+
+Selectors:
+- X column: first variable.
+- Y column: second variable.
+
+What it does:
+- Converts the chosen columns to numeric form.
+- Computes Pearson correlation, covariance, and R-squared.
+- Shows a scatter plot of the two variables.
+
+Regression
+This is simple linear regression with one X variable and one Y variable.
+
+Selectors:
+- X column: predictor variable.
+- Y column: response variable.
+
+What it does:
+- Fits a straight line using ordinary least squares.
+- Reports slope, intercept, Pearson r, R-squared, RMSE, MAE, residual standard deviation, and residual mean.
+- Shows a scatter plot with a fitted line.
+
+Multiple regression
+This predicts one numeric target from several predictors.
+
+Selectors:
+- Target column: the numeric outcome to predict.
+- Predictor columns: the numeric inputs used to explain the target.
+
+What it does:
+- Fits an ordinary least squares model with multiple predictors.
+- Returns a coefficient table with intercept and predictor coefficients.
+- Reports R-squared, adjusted R-squared, RMSE, residual standard deviation, and an F statistic.
+- Shows an actual-versus-predicted scatter plot.
+
+How to read the selectors:
+- Target column is the dependent variable.
+- Predictor columns are the independent variables.
+- If the target column is accidentally included in the predictor list, the app removes it before fitting.
+- Date columns can still contribute if they can be converted to numeric form.
+
+Logistic regression
+This predicts class membership instead of a numeric value.
+
+Selectors:
+- Target column: the class label column.
+- Positive class: which label should count as the positive case.
+- Predictor columns: the numeric inputs used to predict the class.
+
+What it does:
+- Converts the target column into a binary outcome by comparing values to the chosen positive class.
+- Fits a binary logistic regression model using iteratively reweighted least squares.
+- Returns a coefficient table with standard errors, z statistics, and odds ratios.
+- Reports McFadden pseudo-R-squared, accuracy, and a confusion matrix.
+- Shows a plot of predicted probability by class.
+
+How to read the selectors:
+- Target column is the class label.
+- Positive class is the label treated as 1.
+- Predictor columns should be numeric or datetime columns that can be converted into numeric values.
+- If the target column is accidentally included in the predictor list, the app removes it before fitting.
+
+T-test
+This compares the means of two groups.
+
+Selectors:
+- Group column: the column containing the group labels.
+- Value column: the numeric measurement to compare.
+- Group A: first group to compare.
+- Group B: second group to compare.
+
+What it does:
+- Filters the data down to the two selected groups.
+- Runs a two-sample comparison and reports t statistic, mean A, mean B, mean difference, permutation p-value, and Cohen’s d.
+- Shows a box plot of the two groups.
+
+ANOVA
+This compares the means of more than two groups.
+
+Selectors:
+- ANOVA group column: the grouping column.
+- Value column: the numeric measurement to compare.
+
+What it does:
+- Splits the data into groups based on the chosen group column.
+- Runs one-way ANOVA and reports the F statistic and a permutation p-value.
+- Shows a box plot of the group distributions.
+
+Heteroscedasticity
+This checks whether the spread of residuals changes across X.
+
+Selectors:
+- X column: predictor variable.
+- Y column: response variable.
+
+What it does:
+- Uses the selected X and Y columns, like the regression view.
+- Computes diagnostics such as absolute residual correlation, variance ratio, and a permutation p-value.
+- Shows a scatter plot with the selected variables.
+
+PCA
+This reduces several numeric columns into a smaller number of principal components.
+
+Selectors:
+- Columns: the numeric or datetime columns to include.
+- Components: the number of principal components to calculate.
+- Standardize columns: whether to scale the columns before fitting PCA.
+
+What it does:
+- Converts the selected columns to numeric form.
+- Fits PCA and returns scores, loadings, and explained variance.
+- Suggests a component count based on the elbow of the cumulative explained-variance curve for the selected columns.
+- Shows either a PC1 vs PC2 score plot or an explained-variance plot if fewer than two components are available.
+
+Extra statistical controls
+These controls affect the preview plots, not the actual model fit.
+
+Selectors:
+- Color points by K-means clusters: adds cluster coloring to supported plots.
+- Clusters (k): sets the number of clusters used for that coloring.
+- Log X axis and Log Y axis: applies log scaling when the plotted values are numeric and strictly positive.
+
+How the statistics output is organized
+- The left side of the Statistics panel is the control area.
+- The right side shows the text result cards and the plot preview.
+- The app also exposes a Save results to CSV button for exporting the current statistics output.
+
+Practical summary
+- Use Descriptive to inspect one column.
+- Use Correlation to measure association between two variables.
+- Use Regression to fit one numeric predictor against one numeric response.
+- Use Multiple regression when you need several predictors.
+- Use Logistic regression when the target is a class label.
+- Use T-test or ANOVA when you want to compare groups.
+- Use Heteroscedasticity when you want to inspect changing spread across X.
+- Use PCA when you want to reduce many columns into fewer components.
